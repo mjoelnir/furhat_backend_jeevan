@@ -1,6 +1,6 @@
 plugins {
-    id "org.jetbrains.kotlin.jvm" version "1.8.21"
-    id 'com.github.johnrengelman.shadow' version '2.0.4'
+    id "org.jetbrains.kotlin.jvm" version "1.9.22"
+    id "com.github.johnrengelman.shadow" version "8.1.1"
 }
 
 apply plugin: 'java'
@@ -74,7 +74,8 @@ shadowJar {
     properties.load(project.file('skill.properties').newDataInputStream())
     def version = properties.getProperty('version')
     def name = properties.getProperty('name')
-    archiveName = "${name}_${version}.skill"
+    archiveFileName.set("${name}_${version}.skill")
+    archiveExtension.set("skill")
 
     manifest {
         exclude '**/Log4j2Plugins.dat'
@@ -82,5 +83,4 @@ shadowJar {
     }
     from "skill.properties"
     from "assets"
-    extension 'skill'
 }

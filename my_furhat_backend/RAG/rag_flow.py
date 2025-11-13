@@ -98,9 +98,19 @@ class RAG:
             The initialized embedding model
         """
         if self.hf:
+            # Auto-detect device: prefer MPS (macOS), then CUDA, then CPU
+            import torch
+            if torch.backends.mps.is_available():
+                device = 'mps'
+            elif torch.cuda.is_available():
+                device = 'cuda'
+            else:
+                device = 'cpu'
+            logger.info(f"Using device: {device} for embeddings")
+            
             return HuggingFaceEmbeddings(
                 model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cuda'},
+                model_kwargs={'device': device},
                 encode_kwargs={'normalize_embeddings': True}
             )
         else:

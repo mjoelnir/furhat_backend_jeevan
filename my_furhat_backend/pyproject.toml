@@ -1,0 +1,47 @@
+[project]
+name = "my-furhat-backend"
+version = "0.1.0"
+description = "AI Agent"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "requests>=2.32.3,<3.0.0",
+    "python-dotenv>=1.0.1,<2.0.0",
+    "pydantic>=2.10.6,<3.0.0",
+    "transformers @ git+https://github.com/huggingface/transformers.git",
+    # "langchain-huggingface>=0.1.2,<0.2.0",  # Commented out: requires sentence-transformers which is incompatible with transformers 5.0.0.dev0
+    "pydantic-settings>=2.7.1,<3.0.0",
+    "huggingface-hub>=1.0.0,<2.0.0",
+    "accelerate @ git+https://github.com/huggingface/accelerate.git",
+    "torch>=2.6.0,<3.0.0",
+    "gguf>=0.10.0",
+    "protobuf>=5.29.3,<6.0.0",
+    "fastapi>=0.115.8,<0.116.0",
+    "uvicorn>=0.34.0,<0.35.0",
+    "langgraph>=0.3.25,<0.4.0",
+    "langchain>=0.3.23,<0.4.0",
+    "langchain-community>=0.3.21,<0.4.0",
+    "langchain-chroma>=0.2.2,<0.3.0",
+    "pypdf>=5.4.0,<6.0.0"
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0,<9.0.0"]
+
+[tool.setuptools]
+package-dir = {"my_furhat_backend" = "."}
+packages = [
+    "my_furhat_backend",
+    "my_furhat_backend.agents",
+    "my_furhat_backend.api",
+    "my_furhat_backend.api_clients",
+    "my_furhat_backend.config",
+    "my_furhat_backend.llm_tools",
+    "my_furhat_backend.models",
+    "my_furhat_backend.RAG",
+    "my_furhat_backend.utils",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+

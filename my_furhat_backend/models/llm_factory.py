@@ -16,6 +16,7 @@ Functions:
 from abc import ABC, abstractmethod
 import multiprocessing
 from langchain_community.chat_models import ChatLlamaCpp
+from langchain_community.chat_models import ChatOllama
 from my_furhat_backend.config.settings import config
 from my_furhat_backend.utils.gpu_utils import setup_gpu, move_model_to_device, print_gpu_status, clear_gpu_cache
 from transformers import pipeline
@@ -327,6 +328,85 @@ class LlamaCcpLLM(BaseLLM):
         """
         self.chat_llm.bind_tools(tools)
 
+class OllamaLLM(BaseLLM):
+    """
+    LLM implementation using an Ollama server (http://localhost:11434 by default).
+    Suitable for multilingual models like llama3.1, mixtral, qwen2.5, etc.
+    Mirrors the query/bind_tools interface of other backends.
+    """
+
+    def __init__(
+        self,
+        model: str = "llama3.1:instruct",
+        base_url: str = "http://localhost:11434",
+        **kwargs
+    ):
+        """
+        Args:
+            model: Ollama model name/tag (e.g., 'llama3.1:instruct', 'mixtral:8x7b-instruct', 'qwen2.5:14b-instruct').
+            base_url: Ollama server URL.
+            **kwargs: Generation/runtime options (temperature, top_p, num_ctx, num_gpu, repeat_penalty, etc.).
+        """
+        self.model = model
+        self.base_url = base_url
+        self.gen_kwargs = {
+            # Reasonable multilingual/chat defaults; override via **kwargs
+            "temperature": 0.8,
+            "top_p": 0.9,
+            "num_ctx": 8192,     # increase if you need longer prompts
+            # You can pass num_gpu, num_thread, repeat_penalty, stop, etc.
+        }
+        self.gen_kwargs.update(kwargs)
+
+        # Eager check that Ollama server is reachable (optional but helpful)
+        try:
+            r = requests.get(f"{self.base_url}/api/tags", timeout=2)
+            r.raise_for_status()
+        except Exception as e:
+            print(f"[OllamaLLM] Warning: Could not reach Ollama at {self.base_url}: {e}")
+
+        # LangChain wrapper; keeps your interface consistent with ChatLlamaCpp
+        # ChatOllama accepts model/base_url and a dict of 'options' for runtime
+        self.chat_llm = ChatOllama(
+            model=self.model,
+            base_url=self.base_url,
+            # map gen kwargs into options LangChain forwards to Ollama
+            options=self.gen_kwargs
+        )
+
+    def __del__(self):
+        try:
+            clear_gpu_cache()
+        except Exception:
+            pass
+
+    def bind_tools(self, tools: list, tool_schema: dict | str = None) -> None:
+        """
+        Bind tool specs to this chat model (LangChain will convert tools into
+        the proper JSON schema format for tool calling).
+        """
+        try:
+            self.chat_llm = self.chat_llm.bind_tools(tools)
+        except Exception as e:
+            print(f"[OllamaLLM] bind_tools error: {e}")
+
+    def query(self, text: str, tool: bool = False) -> str:
+        """
+        Send a prompt to the Ollama model. If you've bound tools, LangChain will handle tool calling.
+        """
+        try:
+            print_gpu_status()
+            # For Chat models, we can use .invoke with a simple human message
+            # If you prefer plain text, LangChain accepts string directly.
+            out = self.chat_llm.invoke(text)
+            print_gpu_status()
+            # ChatOllama returns a BaseMessage or string depending on version;
+            # extract text robustly:
+            return getattr(out, "content", str(out))
+        except Exception as e:
+            print(f"[OllamaLLM] query error: {e}")
+            return ""
+
 def create_llm(llm_type: str, **kwargs) -> BaseLLM:
     """
     Factory function to create an instance of a language model.
@@ -345,7 +425,9 @@ def create_llm(llm_type: str, **kwargs) -> BaseLLM:
         return HuggingFaceLLM(**kwargs)
     elif llm_type == "llama":
         return LlamaCcpLLM(**kwargs)
+    elif llm_type == "ollama":
+        return OllamaLLM(**kwargs)
     else:
         raise ValueError(f"Unsupported LLM type: {llm_type}")
 
-__all__ = ["create_llm", "HuggingFaceLLM", "LlamaCcpLLM", "BaseLLM"]
+__all__ = ["create_llm", "HuggingFaceLLM", "LlamaCcpLLM", "OllamaLLM", "BaseLLM"]

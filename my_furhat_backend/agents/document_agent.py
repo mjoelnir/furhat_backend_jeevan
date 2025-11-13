@@ -24,6 +24,15 @@ import logging
 import uuid
 import shutil
 import sys
+import langgraph.checkpoint.base as _checkpoint_base
+
+# Temporary compatibility shim for langgraph <-> langgraph-checkpoint mismatch.
+# Older versions of langgraph-checkpoint (<2.0.13) do not expose
+# `EXCLUDED_METADATA_KEYS`, but langgraph>=0.3.25 expects it during import.
+# When missing, provide a conservative default so the runtime can proceed.
+if not hasattr(_checkpoint_base, "EXCLUDED_METADATA_KEYS"):
+    _checkpoint_base.EXCLUDED_METADATA_KEYS = set()  # type: ignore[attr-defined]
+
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, BaseMessage, SystemMessage
 from typing_extensions import TypedDict, Annotated, List
@@ -45,6 +54,9 @@ from my_furhat_backend.utils.util import clean_output
 from my_furhat_backend.RAG.rag_flow import RAG
 from my_furhat_backend.utils.gpu_utils import print_gpu_status, clear_gpu_cache
 from my_furhat_backend.models.llm_factory import HuggingFaceLLM
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Set up cache directories
 CACHE_DIR = config["HF_HOME"]
@@ -232,32 +244,21 @@ class DocumentAgent:
     The workflow is implemented as a state graph with checkpointed memory for resumption.
     """
     
-    def __init__(self, model_id: str = "Mistral-7B-Instruct-v0.3.Q4_K_M.gguf"):
-        """
-        Initialize the DocumentAgent.
-
-        Args:
-            model_id (str): ID of the model to use for the chatbot
-        """
-        print_gpu_status()
-        
-        self.memory = MemorySaver()
-        
-        # Initialize RAG with caching
-        self.rag_instance = RAG(
-            hf=True,
-            persist_directory=config["VECTOR_STORE_PATH"],
-            path_to_document=os.path.join(config["DOCUMENTS_PATH"], "NorwAi annual report 2023.pdf")
-        )
-        
-        # Initialize chatbot with optimized settings
-        # Only pass the model_id and essential parameters
+    def __init__(
+        self,
+        model: str = "llama3.1:instruct",  # Ollama model tag
+        base_url: str = "http://localhost:11434",
+        **kwargs
+    ):
+        # Default chatbot backend = Ollama
         self.chatbot = create_chatbot(
-            "llama",
-            model_id=model_id,
-            n_ctx=4096,  # Reduced context window
-            n_batch=512,  # Increased batch size
-            n_gpu_layers=32  # Use more GPU layers
+            "ollama",
+            model=model,
+            base_url=base_url,
+            num_ctx=8192,          # typical context for Ollama
+            temperature=0.7,
+            top_p=0.9,
+            **kwargs
         )
         self.llm = self.chatbot.llm
         
@@ -277,6 +278,30 @@ class DocumentAgent:
         print_gpu_status()
         
         self.graph = StateGraph(State)
+        
+        # Initialize memory checkpointer for state persistence
+        self.memory = MemorySaver()
+        
+        # Initialize RAG instance for document retrieval and context gathering
+        # RAG is needed for:
+        # 1. Retrieving document context in the engage() method
+        # 2. Getting document context in retrieve_context() method
+        # 3. Listing available documents in check_uncertainty() method
+        # Note: RAG can work without documents (empty vector store), but requires langchain-huggingface
+        self.rag_instance = None
+        try:
+            # Check if langchain-huggingface is available (required for RAG)
+            from langchain_huggingface import HuggingFaceEmbeddings
+            self.rag_instance = RAG(
+                hf=True,  # Use HuggingFace embeddings
+                persist_directory=config.get("VECTOR_STORE_PATH"),  # Use configured vector store path
+                path_to_document=None  # Can be set later or via config if needed (works fine without documents)
+            )
+            logger.info("RAG instance initialized successfully (vector store may be empty if no documents loaded)")
+        except ImportError as e:
+            logger.warning(f"langchain-huggingface not available, RAG features disabled: {e}")
+        except Exception as e:
+            logger.warning(f"Failed to initialize RAG instance: {e}. Some features may not work.")
         
         # Initialize caches with larger sizes
         self.question_cache = QuestionCache()
@@ -415,7 +440,11 @@ class DocumentAgent:
             return {"messages": messages}
             
         # Retrieve context from RAG
-        context = self.rag_instance.get_document_context(input_text)
+        if self.rag_instance is None:
+            logger.warning("RAG instance not initialized, returning empty context")
+            context = []
+        else:
+            context = self.rag_instance.get_document_context(input_text)
         self.context_cache[input_text] = context
         
         # Create a ToolMessage with the retrieval results
@@ -1086,6 +1115,9 @@ Generate a direct answer:"""
         Returns:
             str: A conversational follow-up question
         """
+        if self.rag_instance is None:
+            raise ValueError("RAG instance is not initialized. Cannot retrieve document context.")
+        
         # Get document context from cache or retrieve it
         if document_name not in self.context_cache:
             self.context_cache[document_name] = self.rag_instance.get_document_context(document_name)
@@ -1232,7 +1264,7 @@ Generate a single, engaging follow-up question:"""
         user_input = state.get("input", "").lower()
         
         # Check for document name mentions
-        if any(doc.lower() in user_input for doc in self.rag_instance.get_list_docs()):
+        if self.rag_instance is not None and any(doc.lower() in user_input for doc in self.rag_instance.get_list_docs()):
             # Clear conversation memory when switching documents
             self.conversation_memory = []
             return "retrieval"

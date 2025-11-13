@@ -1,7 +1,8 @@
 package furhatos.app.templateadvancedskill.flow
 
-import furhatos.app.templateadvancedskill.flow.main.Idle
 import furhatos.app.templateadvancedskill.flow.main.DocumentWaitingToStart
+import furhatos.app.templateadvancedskill.flow.main.Greeting
+import furhatos.app.templateadvancedskill.flow.main.Idle
 import furhatos.app.templateadvancedskill.setting.*
 import furhatos.flow.kotlin.State
 import furhatos.flow.kotlin.furhat
@@ -17,7 +18,7 @@ val Init: State = state {
     onEntry {
         /** start interaction */
         when {
-            furhat.isVirtual() -> goto(DocumentWaitingToStart) // Convenient to bypass the need for user when running Virtual Furhat
+            furhat.isVirtual() -> goto(Greeting) // Convenient to bypass the need for user when running Virtual Furhat
             users.hasAny() -> {
                 furhat.attend(users.random)
                 goto(DocumentWaitingToStart)

@@ -6,8 +6,12 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.ConnectException
-import okio.IOException
+import java.io.IOException
 import furhatos.nlu.common.*
+import furhatos.app.templateadvancedskill.language.AppLanguage
+import furhatos.app.templateadvancedskill.language.LangDetect
+import furhatos.app.templateadvancedskill.language.LanguageManager
+import furhatos.app.templateadvancedskill.language.setAppLanguage
 import furhatos.app.templateadvancedskill.flow.Parent
 import furhatos.gestures.Gestures
 import furhatos.app.templateadvancedskill.params.LOCAL_BACKEND_URL
@@ -17,64 +21,113 @@ import furhatos.app.templateadvancedskill.nlu.UncertainResponseIntent
 import java.net.SocketTimeoutException
 
 data class Transcription(val content: String)
-
 data class EngageRequest(val document: String, val answer: String)
+
+/** Helper: choose EN/NO text based on language */
+private fun localized(en: String, no: String, lang: AppLanguage): String =
+    if (lang == AppLanguage.NO) no else en
+
+/** Helper: use the most recently set conversation language */
+private fun currentConversationLanguage(): AppLanguage = LanguageManager.current
 
 // Document Q&A state, inheriting from Parent.
 fun documentInfoQnA(documentName: String): State = state(parent = Parent) {
+
     var conversationCount = 0
     var lastQuestion = ""
     var lastAnswer = ""
     var previousQuestions = mutableListOf<String>()
     var previousAnswers = mutableListOf<String>()
-    var userMood = "neutral" // Track user's mood
+    var userMood = "neutral"
     var lastGestureTime = 0L
 
     onEntry {
-        // Lock the attended user during this conversation.
         furhat.gesture(Gestures.Smile)
-        furhat.ask("Hello! I'm here to help you learn about $documentName. What would you like to know?")
+
+        val lang = currentConversationLanguage()
+        val intro = localized(
+            en = "Hello! I'm here to help you learn about $documentName. What would you like to know?",
+            no = "Hei! Jeg er her for å hjelpe deg med $documentName. Hva vil du vite?",
+            lang = lang
+        )
+        furhat.ask(intro)
     }
 
     onExit {
-        // Release the attention lock when leaving this state.
         furhat.gesture(Gestures.Wink)
     }
 
     onResponse<Goodbye> {
+        val lang = currentConversationLanguage()
         furhat.gesture(Gestures.Smile)
-        furhat.say("Thank you for the interesting conversation! Goodbye!")
+        furhat.say(
+            localized(
+                en = "Thank you for the interesting conversation! Goodbye!",
+                no = "Takk for en interessant samtale! Ha det bra!",
+                lang = lang
+            )
+        )
         goto(Idle)
     }
 
     onResponse<No> {
-        // Only end conversation if it's a clear "no" without additional context
+        val lang = currentConversationLanguage()
         if (it.text.matches(Regex("(?i)^(no|nope|nah| no goodbye)$"))) {
             furhat.gesture(Gestures.Nod)
-            furhat.say("Alright, thank you for the conversation. Goodbye!")
+            furhat.say(
+                localized(
+                    en = "Alright, thank you for the conversation. Goodbye!",
+                    no = "Greit, takk for praten. Ha det bra!",
+                    lang = lang
+                )
+            )
             goto(Idle)
         } else {
-            // If it's a "no" with additional context, treat it as a regular response
             raise(it)
         }
     }
 
     onResponse<UncertainResponseIntent> {
-        // Handle uncertain responses by encouraging further discussion
+        val lang = currentConversationLanguage()
+
         furhat.gesture(Gestures.Thoughtful)
         furhat.say {
             random {
-                +"That's an interesting perspective. Let me share what I know about this topic."
-                +"I understand your uncertainty. Let me provide some more information that might help."
-                +"That's a good point to explore further. Let me elaborate on this topic."
+                +localized(
+                    en = "That's an interesting perspective. Let me share what I know about this topic.",
+                    no = "Det er et interessant perspektiv. La meg fortelle det jeg vet om dette temaet.",
+                    lang = lang
+                )
+                +localized(
+                    en = "I understand your uncertainty. Let me provide some more information that might help.",
+                    no = "Jeg forstår at du er usikker. La meg gi litt mer informasjon som kan hjelpe.",
+                    lang = lang
+                )
+                +localized(
+                    en = "That's a good point to explore further. Let me elaborate on this topic.",
+                    no = "Det er et godt poeng å utforske videre. La meg utdype dette temaet.",
+                    lang = lang
+                )
             }
         }
-        // Add an engaging follow-up question
+
         furhat.ask {
             random {
-                +"What specific aspect of this topic interests you the most?"
-                +"Would you like to explore a particular angle of this discussion?"
-                +"Is there a specific part you'd like me to focus on?"
+                +localized(
+                    en = "What specific aspect of this topic interests you the most?",
+                    no = "Hvilket aspekt ved dette temaet interesserer deg mest?",
+                    lang = lang
+                )
+                +localized(
+                    en = "Would you like to explore a particular angle of this discussion?",
+                    no = "Vil du utforske en bestemt vinkling av denne diskusjonen?",
+                    lang = lang
+                )
+                +localized(
+                    en = "Is there a specific part you'd like me to focus on?",
+                    no = "Er det en bestemt del du vil at jeg skal fokusere på?",
+                    lang = lang
+                )
             }
         }
     }
@@ -82,37 +135,42 @@ fun documentInfoQnA(documentName: String): State = state(parent = Parent) {
     onResponse {
         val userQuestion = it.text.trim()
         conversationCount++
-        
-        // Update user mood based on question content
+
+        // Detect language from the *current* question and switch ASR/TTS
+        val detectedLanguage = LangDetect.detect(userQuestion)
+        setAppLanguage(detectedLanguage)
+
+        val preferredLanguage = when (detectedLanguage) {
+            AppLanguage.EN -> "English"
+            AppLanguage.NO -> "Norwegian"
+        }
+
+        // Mood detection stays as-is
         userMood = when {
             userQuestion.contains(Regex("(great|wonderful|amazing|excellent)", RegexOption.IGNORE_CASE)) -> "positive"
             userQuestion.contains(Regex("(bad|terrible|awful|horrible)", RegexOption.IGNORE_CASE)) -> "negative"
             else -> "neutral"
         }
-        
-        // Natural thinking gesture - only if the question is complex
+
         if (userQuestion.split(" ").size > 5) {
             furhat.gesture(Gestures.GazeAway, priority = 1)
         }
-        
-        // Call the backend /ask endpoint to get an answer
-        val answer = callDocumentAgent(userQuestion)
-        
-        // Clean up the answer - remove URLs and extra whitespace, but keep the complete response
+
+        // Call backend with preferred_language
+        val answer = callDocumentAgent(userQuestion, preferredLanguage)
+
         val cleanAnswer = answer
             .replace(Regex("https?://\\S+"), "")
             .replace(Regex("\\s+"), " ")
             .trim()
-        
-        // Store the Q&A pair for context
+
         previousQuestions.add(userQuestion)
         previousAnswers.add(cleanAnswer)
         lastQuestion = userQuestion
         lastAnswer = cleanAnswer
-        
-        // Add natural gestures while speaking, but less frequently
+
         val currentTime = System.currentTimeMillis()
-        if (currentTime - lastGestureTime > 5000) { // Increased to 5 seconds between gestures
+        if (currentTime - lastGestureTime > 5000) {
             when (userMood) {
                 "positive" -> furhat.gesture(Gestures.Smile, priority = 2)
                 "negative" -> furhat.gesture(Gestures.ExpressSad, priority = 2)
@@ -120,88 +178,135 @@ fun documentInfoQnA(documentName: String): State = state(parent = Parent) {
             }
             lastGestureTime = currentTime
         }
-        
-        // Speak the cleaned answer with natural pauses
+
         furhat.say(cleanAnswer)
-        
-        // Generate a contextual follow-up based on conversation history and user mood
+
+        // Localized follow-ups
         val followUpPrompt = when {
-            conversationCount == 1 -> {
-                // First follow-up: Focus on specific aspects mentioned in the answer
-                val keyAspects = cleanAnswer.split(".").take(2).joinToString(" ")
-                when (userMood) {
-                    "positive" -> "What would you like to know more about?"
-                    "negative" -> "Would you like me to explain that differently?"
-                    else -> "What interests you most about that?"
-                }
+            conversationCount == 1 -> when (userMood) {
+                "positive" -> localized(
+                    en = "What would you like to know more about?",
+                    no = "Hva vil du vite mer om?",
+                    lang = detectedLanguage
+                )
+                "negative" -> localized(
+                    en = "Would you like me to explain that differently?",
+                    no = "Vil du at jeg skal forklare det på en annen måte?",
+                    lang = detectedLanguage
+                )
+                else -> localized(
+                    en = "What interests you most about that?",
+                    no = "Hva synes du er mest interessant med det?",
+                    lang = detectedLanguage
+                )
             }
-            conversationCount == 2 -> {
-                // Second follow-up: Connect to previous question
-                when (userMood) {
-                    "positive" -> "Want to explore that further?"
-                    "negative" -> "Would you like me to clarify anything?"
-                    else -> "What would you like to know more about?"
-                }
+
+            conversationCount == 2 -> when (userMood) {
+                "positive" -> localized(
+                    en = "Want to explore that further?",
+                    no = "Vil du utforske det videre?",
+                    lang = detectedLanguage
+                )
+                "negative" -> localized(
+                    en = "Would you like me to clarify anything?",
+                    no = "Vil du at jeg skal forklare noe nærmere?",
+                    lang = detectedLanguage
+                )
+                else -> localized(
+                    en = "What would you like to know more about?",
+                    no = "Hva vil du vite mer om?",
+                    lang = detectedLanguage
+                )
             }
+
             else -> {
-                // Later follow-ups: Use conversation history for context
                 try {
                     val engagePrompt = callEngageUser(documentName, cleanAnswer)
                     if (engagePrompt.isNotEmpty()) {
-                        // Keep the API response simple and natural
                         engagePrompt
                     } else {
-                        // Simple fallback based on mood
                         when (userMood) {
-                            "positive" -> "What would you like to explore next?"
-                            "negative" -> "Would you like me to explain something else?"
-                            else -> "What interests you most?"
+                            "positive" -> localized(
+                                en = "What would you like to explore next?",
+                                no = "Hva vil du utforske videre?",
+                                lang = detectedLanguage
+                            )
+                            "negative" -> localized(
+                                en = "Would you like me to explain something else?",
+                                no = "Vil du at jeg skal forklare noe annet?",
+                                lang = detectedLanguage
+                            )
+                            else -> localized(
+                                en = "What interests you most?",
+                                no = "Hva synes du er mest interessant?",
+                                lang = detectedLanguage
+                            )
                         }
                     }
                 } catch (e: Exception) {
-                    // Simple fallback based on mood
                     when (userMood) {
-                        "positive" -> "What would you like to explore next?"
-                        "negative" -> "Would you like me to explain something else?"
-                        else -> "What interests you most?"
+                        "positive" -> localized(
+                            en = "What would you like to explore next?",
+                            no = "Hva vil du utforske videre?",
+                            lang = detectedLanguage
+                        )
+                        "negative" -> localized(
+                            en = "Would you like me to explain something else?",
+                            no = "Vil du at jeg skal forklare noe annet?",
+                            lang = detectedLanguage
+                        )
+                        else -> localized(
+                            en = "What interests you most?",
+                            no = "Hva synes du er mest interessant?",
+                            lang = detectedLanguage
+                        )
                     }
                 }
             }
         }
-        
-        // Ask the follow-up question with appropriate gesture
+
         when (userMood) {
             "positive" -> furhat.gesture(Gestures.Smile, priority = 2)
             "negative" -> furhat.gesture(Gestures.ExpressSad, priority = 2)
             else -> furhat.gesture(Gestures.Nod, priority = 2)
         }
+
         furhat.ask(followUpPrompt)
     }
 
     onNoResponse {
+        val lang = currentConversationLanguage()
         furhat.gesture(Gestures.ExpressSad)
-        furhat.ask("I didn't catch that. Could you please repeat your question?")
+        furhat.ask(
+            localized(
+                en = "I didn't catch that. Could you please repeat your question?",
+                no = "Jeg oppfattet ikke det. Kan du gjenta spørsmålet?",
+                lang = lang
+            )
+        )
         reentry()
     }
 }
 
-// Helper function to call the /ask endpoint.
-private fun callDocumentAgent(question: String): String {
+// Helper function to call the /ask endpoint (now with preferred_language).
+private fun callDocumentAgent(question: String, preferredLanguage: String): String {
     val baseUrl = AWS_BACKEND_URL
     val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
+
     return try {
         val requestBody = JSONObject()
             .put("content", question)
-            .put("max_tokens", 2000)  // Increased token limit
-            .put("temperature", 0.7)  // Add temperature for more controlled generation
-            .put("top_p", 0.9)        // Add top_p for better response quality
+            .put("preferred_language", preferredLanguage)
+            .put("max_tokens", 2000)
+            .put("temperature", 0.7)
+            .put("top_p", 0.9)
             .toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
-        
+
         val request = Request.Builder()
             .url("$baseUrl/ask")
             .post(requestBody)
@@ -212,48 +317,61 @@ private fun callDocumentAgent(question: String): String {
                 println("Error response from backend: ${response.code} - ${response.message}")
                 throw IOException("Unexpected response: $response")
             }
-            
+
             val jsonResponse = response.body?.string() ?: throw IOException("Empty response")
             val jsonObject = JSONObject(jsonResponse)
-            
-            // Log the response length for debugging
+
             val responseText = jsonObject.getString("response")
             println("Response length: ${responseText.length} characters")
-            
-            // Check for potential truncation
-            if (responseText.endsWith("...") || 
-                responseText.endsWith(".") == false || 
-                responseText.length > 1900) {  // Close to max_tokens limit
+
+            if (responseText.endsWith("...") ||
+                !responseText.endsWith(".") ||
+                responseText.length > 1900
+            ) {
                 println("Warning: Response might be truncated")
-                // You might want to handle this case differently, e.g., by requesting continuation
             }
-            
+
             responseText
         }
+
     } catch (e: ConnectException) {
-        println("Connection error: ${e.message}")
-        "I'm sorry, I cannot process your request right now. Please try again in a moment."
+        val lang = currentConversationLanguage()
+        localized(
+            en = "I'm sorry, I cannot process your request right now. Please try again in a moment.",
+            no = "Beklager, jeg kan ikke behandle forespørselen din akkurat nå. Prøv igjen om litt.",
+            lang = lang
+        )
     } catch (e: SocketTimeoutException) {
-        println("Timeout error: ${e.message}")
-        "I'm sorry, the request took too long to process. Please try asking your question again."
+        val lang = currentConversationLanguage()
+        localized(
+            en = "I'm sorry, the request took too long to process. Please try asking your question again.",
+            no = "Beklager, forespørselen tok for lang tid. Prøv å stille spørsmålet på nytt.",
+            lang = lang
+        )
     } catch (e: Exception) {
-        println("Error processing question: ${e.message}")
-        "I apologize, but I encountered an error processing your question. Could you please rephrase it?"
+        val lang = currentConversationLanguage()
+        localized(
+            en = "I apologize, but I encountered an error processing your question. Could you please rephrase it?",
+            no = "Beklager, det oppstod en feil da jeg skulle behandle spørsmålet ditt. Kan du formulere det på en annen måte?",
+            lang = lang
+        )
     }
 }
 
-// Helper function to call the /engage endpoint.
+// Helper function to call the /engage endpoint (unchanged logic, language handled by backend).
 private fun callEngageUser(documentName: String, answer: String): String {
-    val baseUrl = AWS_BACKEND_URL
+    val baseUrl = AWS_BACKEND_URL  // or switch based on config if needed
     val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
+
     return try {
         val map = JSONObject()
         map.put("document", documentName)
         map.put("answer", answer)
+
         val requestBody = map.toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
@@ -266,15 +384,11 @@ private fun callEngageUser(documentName: String, answer: String): String {
             if (!response.isSuccessful) throw IOException("Unexpected response: $response")
             val jsonResponse = response.body?.string() ?: throw IOException("Empty response")
             val jsonObject = JSONObject(jsonResponse)
-            try {
-                jsonObject.getString("prompt")
-            } catch (e: Exception) {
-                ""  // Return empty string to trigger fallback question
-            }
+            jsonObject.optString("prompt", "")
         }
     } catch (e: ConnectException) {
-        ""  // Return empty string to trigger fallback question
+        ""
     } catch (e: Exception) {
-        ""  // Return empty string to trigger fallback question
+        ""
     }
 }
