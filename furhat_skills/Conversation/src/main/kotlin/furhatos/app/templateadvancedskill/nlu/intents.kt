@@ -2,6 +2,8 @@ package furhatos.app.templateadvancedskill.nlu
 
 import furhatos.nlu.Intent
 import furhatos.util.Language
+import furhatos.nlu.common.PersonName
+import furhatos.app.templateadvancedskill.language.AppLanguage
 
 /**
  * Define intents to match a user utterance and assign meaning to what they said.
@@ -89,5 +91,35 @@ class UncertainResponseIntent : Intent() {
             "I'm not sure what to make of this",
             "I'm not sure what to make of it"
         )
+    }
+}
+
+/**
+ * capture the user's name in both English and Norwegian.
+ */
+class MyNameIsIntent(
+    val name: PersonName? = null
+) : Intent() {
+
+    override fun getExamples(lang: Language): List<String> {
+        return when (lang) {
+            Language.ENGLISH_US -> listOf(
+                "My name is @name",
+                "I am @name",
+                "I'm @name",
+                "You can call me @name",
+                "It's @name"
+            )
+            Language.NORWEGIAN -> listOf(
+                "Jeg heter @name",
+                "Mitt navn er @name",
+                "Jeg er @name",
+                "Du kan kalle meg @name"
+            )
+            else -> listOf(
+                "My name is @name",
+                "I am @name"
+            )
+        }
     }
 }

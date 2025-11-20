@@ -19,6 +19,9 @@ import furhatos.app.templateadvancedskill.params.AWS_BACKEND_URL
 import java.util.concurrent.TimeUnit
 import furhatos.app.templateadvancedskill.nlu.UncertainResponseIntent
 import java.net.SocketTimeoutException
+import furhatos.app.templateadvancedskill.nlu.MyNameIsIntent
+import furhatos.app.templateadvancedskill.perception.UserState
+
 
 data class Transcription(val content: String)
 data class EngageRequest(val document: String, val answer: String)
@@ -54,6 +57,8 @@ fun documentInfoQnA(documentName: String): State = state(parent = Parent) {
     }
 
     onExit {
+        // Close perception client when leaving the Q&A state
+        users.current.perceptionClient?.close()
         furhat.gesture(Gestures.Wink)
     }
 
@@ -85,6 +90,33 @@ fun documentInfoQnA(documentName: String): State = state(parent = Parent) {
         } else {
             raise(it)
         }
+    }
+
+    onResponse<MyNameIsIntent> {
+        val name = it.intent.name?.toText() ?: return@onResponse
+
+        val profile = UserState.currentProfile
+        if (profile != null) {
+            profile.name = name
+        }
+
+        val client = users.current.perceptionClient
+        client?.sendNameUpdate(
+            userId = profile?.id,
+            name = name
+        )
+
+        val lang = currentConversationLanguage()
+        furhat.say(
+            localized(
+                en = "Nice to meet you, $name!",
+                no = "Hyggelig å møte deg, $name!",
+                lang = lang
+            )
+        )
+
+        // Go back to the normal questioning flow
+        reentry()
     }
 
     onResponse<UncertainResponseIntent> {
@@ -180,6 +212,21 @@ fun documentInfoQnA(documentName: String): State = state(parent = Parent) {
         }
 
         furhat.say(cleanAnswer)
+
+        val client = users.current.perceptionClient
+        val profile = UserState.currentProfile
+
+        val langCode = when (detectedLanguage) {
+            AppLanguage.EN -> "en"
+            AppLanguage.NO -> "no"
+        }
+
+        client?.sendTurn(
+            userId = profile?.id,
+            language = langCode,
+            userText = userQuestion,
+            robotText = cleanAnswer
+        )
 
         // Localized follow-ups
         val followUpPrompt = when {

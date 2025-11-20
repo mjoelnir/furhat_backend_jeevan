@@ -48,6 +48,8 @@ dependencies {
     implementation 'com.furhatrobotics.assets:StandardLibraryCollection:1.2.0'
     // Additional dependencies for HTTP calls, JSON processing, and coroutines
     implementation "com.squareup.okhttp3:okhttp:4.10.0"
+    implementation "com.fasterxml.jackson.core:jackson-annotations:2.15.2"
+    implementation "com.fasterxml.jackson.module:jackson-module-kotlin:2.15.2"
     implementation "org.json:json:20210307"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4"
 }
