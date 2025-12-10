@@ -14,6 +14,10 @@ val Init: State = state {
     init {
         /** Set our default interaction parameters */
         users.setSimpleEngagementPolicy(DISTANCE_TO_ENGAGE, MAX_NUMBER_OF_USERS)
+        // Add a small end-of-speech silence buffer so the robot waits
+        // ~1.5–2 seconds after the user stops talking before responding.
+        // This helps avoid interrupting users who pause briefly mid-utterance.
+        furhat.param.endSilTimeout = 2000
     }
     onEntry {
         /** start interaction */

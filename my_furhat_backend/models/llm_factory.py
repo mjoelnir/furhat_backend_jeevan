@@ -1,28 +1,45 @@
 """
 Language Model Factory Module
 
-This module provides a factory pattern implementation for creating and managing different types of language models.
-It supports both HuggingFace and LlamaCpp models with GPU optimization and monitoring capabilities.
-
-Classes:
-    BaseLLM: Abstract base class defining the interface for all LLM implementations.
-    HuggingFaceLLM: Implementation using HuggingFace's API and models.
-    LlamaCcpLLM: Implementation using LlamaCpp for local model inference.
-
-Functions:
-    create_llm: Factory function to create instances of different LLM types.
+Design choices:
+- Provide a unified interface (BaseLLM) for multiple backends.
+- Prefer minimal deps where possible; Ollama can run without torch/transformers.
+- HuggingFace/LlamaCpp paths are guarded behind availability checks to avoid hard
+  failures when GPU/libtorch is missing.
 """
 
 from abc import ABC, abstractmethod
 import multiprocessing
-from langchain_community.chat_models import ChatLlamaCpp
-from langchain_community.chat_models import ChatOllama
-from my_furhat_backend.config.settings import config
-from my_furhat_backend.utils.gpu_utils import setup_gpu, move_model_to_device, print_gpu_status, clear_gpu_cache
-from transformers import pipeline
-import torch
 import os
 import requests
+import shutil
+import subprocess
+import time
+
+try:
+    import torch  # type: ignore[import]
+except Exception as e:  # noqa: BLE001
+    # Torch is only required for local HuggingFace / Llama models.
+    # Ollama-based flows can run without it.
+    print(f"[llm_factory] Torch unavailable, GPU-backed HF/llama models disabled: {e}")
+    torch = None  # type: ignore[assignment]
+
+from langchain_community.chat_models import ChatLlamaCpp
+from langchain_community.chat_models import ChatOllama
+
+try:
+    from transformers import pipeline  # type: ignore[import]
+except Exception as e:  # noqa: BLE001
+    print(f"[llm_factory] Transformers pipeline unavailable, HF models disabled: {e}")
+    pipeline = None  # type: ignore[assignment]
+
+from my_furhat_backend.config.settings import config
+from my_furhat_backend.utils.gpu_utils import (
+    setup_gpu,
+    move_model_to_device,
+    print_gpu_status,
+    clear_gpu_cache,
+)
 
 class BaseLLM(ABC):
     """Abstract base class for all LLM implementations."""
@@ -31,24 +48,17 @@ class BaseLLM(ABC):
     def query(self, text: str, tool: bool = False) -> str:
         """
         Process a query with the language model.
-        
-        Args:
-            text (str): The input text or prompt to be processed.
-            tool (bool): If True, invoke the model with pre-bound tools.
-            
-        Returns:
-            str: The generated response from the language model.
+
+        tool flag is for implementations that support tool-calling; default
+        implementations may ignore it. Kept simple to avoid overfitting to any
+        specific provider API.
         """
         pass
 
     @abstractmethod
     def bind_tools(self, tools: list, tool_schema: dict | str = None) -> None:
         """
-        Bind external tools to the language model for extended functionality.
-        
-        Args:
-            tools (list): A list of tools to be bound to the language model.
-            tool_schema (dict | str, optional): The schema or configuration for the tools.
+        Optional tool-binding hook; no-op for backends that don't support it.
         """
         pass
 
@@ -63,28 +73,49 @@ class HuggingFaceLLM(BaseLLM):
     def __init__(self, model_id: str, task: str = "text-generation", **kwargs):
         """
         Initialize the HuggingFace LLM with optimized settings.
-        
-        Args:
-            model_id (str): The model identifier from HuggingFace
-            task (str): The task type (default: "text-generation")
-            **kwargs: Additional arguments for model configuration
+
+        Design: prefer running local HF pipelines only when torch+transformers
+        are present; otherwise caller should select Ollama.
         """
         self.model_id = model_id
         self.task = task
+        # We require both torch and transformers.pipeline to be available
+        if torch is None or pipeline is None:
+            raise RuntimeError(
+                "Torch/Transformers pipeline is not available; HuggingFaceLLM cannot be "
+                "initialized. Use an Ollama-backed model instead or install a compatible "
+                "PyTorch/Transformers build."
+            )
+
         self.device_info = setup_gpu()
-        
-        # Optimize model loading
-        self.model_kwargs = {
-            "device_map": "auto",  # Automatically handle device placement
-            "torch_dtype": torch.float16,  # Use half precision
-            "low_cpu_mem_usage": True,  # Optimize CPU memory usage
-            "load_in_8bit": True,  # Use 8-bit quantization
-            "max_memory": {0: "16GB"} if self.device_info["cuda_available"] else None
-        }
-        
-        # Update with any additional kwargs
-        self.model_kwargs.update(kwargs)
-        
+
+        # Generation defaults (can be overridden by kwargs)
+        self.max_length = kwargs.pop("max_length", 1024)
+        self.max_new_tokens = kwargs.pop("max_new_tokens", 256)
+        self.temperature = kwargs.pop("temperature", 0.7)
+        self.top_p = kwargs.pop("top_p", 0.9)
+        self.do_sample = kwargs.pop("do_sample", True)
+        self.extra_generation_kwargs = {}
+        for key in ("min_length", "no_repeat_ngram_size", "repetition_penalty"):
+            if key in kwargs:
+                self.extra_generation_kwargs[key] = kwargs.pop(key)
+
+        # torch-related model kwargs
+        dtype = torch.float16 if self.device_info["cuda_available"] else torch.float32
+        self.model_kwargs = {"torch_dtype": dtype}
+
+        # Choose device for the pipeline: CUDA -> 0, CPU -> -1, fallback to MPS string if available
+        if self.device_info["cuda_available"]:
+            self.pipeline_device = 0
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.pipeline_device = "mps"
+        else:
+            self.pipeline_device = -1
+
+        # Allow explicit overrides via model_kwargs argument
+        extra_model_kwargs = kwargs.pop("model_kwargs", {})
+        self.model_kwargs.update(extra_model_kwargs)
+
         # Create the pipeline with optimized settings
         self.__create_pipeline()
         
@@ -93,7 +124,7 @@ class HuggingFaceLLM(BaseLLM):
         clear_gpu_cache()
     
     def __create_pipeline(self):
-        """Create the HuggingFace pipeline with optimized settings."""
+        """Create the HuggingFace pipeline with optimized settings; fallback to CPU on failure."""
         try:
             # Clear GPU cache before loading
             clear_gpu_cache()
@@ -102,7 +133,8 @@ class HuggingFaceLLM(BaseLLM):
             self.pipeline = pipeline(
                 task=self.task,
                 model=self.model_id,
-                **self.model_kwargs
+                device=self.pipeline_device,
+                model_kwargs=self.model_kwargs
             )
             
             # Move model to GPU if available
@@ -114,11 +146,11 @@ class HuggingFaceLLM(BaseLLM):
         except Exception as e:
             print(f"Error creating pipeline: {e}")
             # Fallback to CPU if GPU fails
-            self.model_kwargs["device_map"] = "cpu"
             self.pipeline = pipeline(
                 task=self.task,
                 model=self.model_id,
-                **self.model_kwargs
+                device=-1,
+                model_kwargs={"torch_dtype": torch.float32}
             )
     
     def __truncate_input(self, prompt: str) -> str:
@@ -136,7 +168,12 @@ class HuggingFaceLLM(BaseLLM):
             if not tokenizer:
                 return prompt
                 
-            tokens = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.model_kwargs["max_length"])
+            tokens = tokenizer(
+                prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+            )
             return tokenizer.decode(tokens["input_ids"][0])
         except Exception as e:
             print(f"Error truncating input: {e}")
@@ -145,12 +182,8 @@ class HuggingFaceLLM(BaseLLM):
     def query(self, prompt: str) -> str:
         """
         Process a query with optimized inference parameters.
-        
-        Args:
-            prompt (str): The input text or prompt to be processed.
-            
-        Returns:
-            str: The generated response from the language model.
+
+        Keeps generation config minimal and truncates inputs to avoid OOM.
         """
         try:
             # Truncate input to prevent OOM errors
@@ -159,26 +192,33 @@ class HuggingFaceLLM(BaseLLM):
             if self.pipeline:
                 # Optimize generation parameters
                 generation_config = {
-                    "max_new_tokens": 256,  # Reduced from 512
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                    "do_sample": True,
-                    "num_beams": 1,  # Use greedy decoding for speed
-                    "pad_token_id": self.pipeline.tokenizer.eos_token_id,
-                    "use_cache": True,  # Enable KV cache
-                    "return_dict_in_generate": True
+                    "max_new_tokens": self.max_new_tokens,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                    "do_sample": self.do_sample,
+                    "num_beams": 1,
+                    "pad_token_id": getattr(
+                        self.pipeline.tokenizer, "eos_token_id", None
+                    ),
+                    "use_cache": True,
+                    "return_dict_in_generate": True,
                 }
+                generation_config.update(self.extra_generation_kwargs)
                 
                 # Generate response with optimized parameters
-                result = self.pipeline(
-                    truncated_prompt,
-                    **generation_config
-                )
+                result = self.pipeline(truncated_prompt, **generation_config)
                 
                 if isinstance(result, list) and len(result) > 0:
-                    if isinstance(result[0], dict):
-                        return result[0]["generated_text"]
-                    return result[0]
+                    entry = result[0]
+                    if isinstance(entry, dict):
+                        if "generated_text" in entry:
+                            return entry["generated_text"]
+                        if "summary_text" in entry:
+                            return entry["summary_text"]
+                        # Some pipelines wrap text differently
+                        if "text" in entry:
+                            return entry["text"]
+                    return entry
                 return str(result)
             else:
                 # Fallback to API if pipeline fails
@@ -188,12 +228,13 @@ class HuggingFaceLLM(BaseLLM):
                     json={
                         "inputs": truncated_prompt,
                         "parameters": {
-                            "max_new_tokens": 256,
-                            "temperature": 0.7,
-                            "top_p": 0.9,
-                            "do_sample": True
-                        }
-                    }
+                            "max_new_tokens": self.max_new_tokens,
+                            "temperature": self.temperature,
+                            "top_p": self.top_p,
+                            "do_sample": self.do_sample,
+                            **self.extra_generation_kwargs,
+                        },
+                    },
                 )
                 response.raise_for_status()
                 return response.json()[0]["generated_text"]
@@ -337,18 +378,20 @@ class OllamaLLM(BaseLLM):
 
     def __init__(
         self,
-        model: str = "llama3.1:instruct",
+        model: str = "llama3.2:latest",
         base_url: str = "http://localhost:11434",
+        system_prompt: str | None = None,
         **kwargs
     ):
         """
         Args:
-            model: Ollama model name/tag (e.g., 'llama3.1:instruct', 'mixtral:8x7b-instruct', 'qwen2.5:14b-instruct').
+            model: Ollama model name/tag (e.g., 'llama3.2:latest', 'mixtral:8x7b-instruct', 'qwen2.5:14b-instruct').
             base_url: Ollama server URL.
             **kwargs: Generation/runtime options (temperature, top_p, num_ctx, num_gpu, repeat_penalty, etc.).
         """
         self.model = model
         self.base_url = base_url
+        self.system_prompt = system_prompt
         self.gen_kwargs = {
             # Reasonable multilingual/chat defaults; override via **kwargs
             "temperature": 0.8,
@@ -358,21 +401,105 @@ class OllamaLLM(BaseLLM):
         }
         self.gen_kwargs.update(kwargs)
 
-        # Eager check that Ollama server is reachable (optional but helpful)
-        try:
-            r = requests.get(f"{self.base_url}/api/tags", timeout=2)
-            r.raise_for_status()
-        except Exception as e:
-            print(f"[OllamaLLM] Warning: Could not reach Ollama at {self.base_url}: {e}")
+        self.chat_llm = None
+        self.fallback_llm = None
 
-        # LangChain wrapper; keeps your interface consistent with ChatLlamaCpp
-        # ChatOllama accepts model/base_url and a dict of 'options' for runtime
-        self.chat_llm = ChatOllama(
-            model=self.model,
-            base_url=self.base_url,
-            # map gen kwargs into options LangChain forwards to Ollama
-            options=self.gen_kwargs
-        )
+        if not self._initialize_chat_llm():
+            print(
+                "[OllamaLLM] Ollama server unavailable. Falling back to HuggingFace model."
+            )
+            fallback_model = os.getenv(
+                "OLLAMA_FALLBACK_MODEL", "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+            )
+            try:
+                self.fallback_llm = HuggingFaceLLM(model_id=fallback_model)
+            except Exception as e:
+                print(f"[OllamaLLM] Failed to initialize fallback HuggingFace model: {e}")
+
+    _boot_attempted = False
+    _model_pull_attempted = False
+
+    def _initialize_chat_llm(self) -> bool:
+        if not self._ensure_ollama_server():
+            return False
+        self._pull_model()
+        try:
+            self.chat_llm = ChatOllama(
+                model=self.model,
+                base_url=self.base_url,
+                system=self.system_prompt,
+                options=self.gen_kwargs,
+            )
+            return True
+        except Exception as e:
+            print(f"[OllamaLLM] Failed to initialize ChatOllama: {e}")
+            self.chat_llm = None
+            return False
+
+    def _ping_server(self, timeout: float = 2.0) -> bool:
+        try:
+            r = requests.get(f"{self.base_url}/api/tags", timeout=timeout)
+            r.raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    def _start_ollama_process(self) -> bool:
+        ollama_binary = shutil.which("ollama")
+        if not ollama_binary:
+            return False
+
+        try:
+            subprocess.Popen(
+                [ollama_binary, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            # give the server a moment to start
+            for _ in range(5):
+                time.sleep(1)
+                if self._ping_server(timeout=1.0):
+                    return True
+        except Exception as e:
+            print(f"[OllamaLLM] Failed to start Ollama process: {e}")
+        return False
+
+    def _ensure_ollama_server(self) -> bool:
+        if self._ping_server():
+            return True
+
+        if not OllamaLLM._boot_attempted:
+            OllamaLLM._boot_attempted = True
+            if self._start_ollama_process():
+                return True
+
+        return self._ping_server(timeout=3.0)
+
+    def _pull_model(self) -> bool:
+        if OllamaLLM._model_pull_attempted:
+            return False
+
+        ollama_binary = shutil.which("ollama")
+        if not ollama_binary:
+            print("[OllamaLLM] Cannot pull model because the 'ollama' binary is not in PATH.")
+            OllamaLLM._model_pull_attempted = True
+            return False
+
+        print(f"[OllamaLLM] Attempting to pull model '{self.model}' via 'ollama pull'.")
+        try:
+            subprocess.run(
+                [ollama_binary, "pull", self.model],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            OllamaLLM._model_pull_attempted = True
+            return True
+        except Exception as e:
+            print(f"[OllamaLLM] Failed to pull model '{self.model}': {e}")
+            OllamaLLM._model_pull_attempted = True
+            return False
 
     def __del__(self):
         try:
@@ -394,18 +521,51 @@ class OllamaLLM(BaseLLM):
         """
         Send a prompt to the Ollama model. If you've bound tools, LangChain will handle tool calling.
         """
+        if self.chat_llm is not None:
+            try:
+                print_gpu_status()
+                out = self.chat_llm.invoke(text)
+                print_gpu_status()
+                return getattr(out, "content", str(out))
+            except Exception as e:
+                print(f"[OllamaLLM] query error: {e}")
+                # Mark Ollama connection unusable so we can transparently
+                # fall back to HuggingFace on subsequent calls.
+                if "status code 404" in str(e) and self._pull_model():
+                    if self._initialize_chat_llm():
+                        try:
+                            out = self.chat_llm.invoke(text)
+                            return getattr(out, "content", str(out))
+                        except Exception as second_e:
+                            print(f"[OllamaLLM] query error after pulling model: {second_e}")
+                self.chat_llm = None
+                if self.fallback_llm is None:
+                    fallback_model = os.getenv(
+                        "OLLAMA_FALLBACK_MODEL", "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+                    )
+                    try:
+                        self.fallback_llm = HuggingFaceLLM(model_id=fallback_model)
+                    except Exception as err:
+                        print(
+                            f"[OllamaLLM] Failed to initialize fallback HuggingFace model: {err}"
+                        )
+
+        fallback_response = self._invoke_fallback(text, tool)
+        if fallback_response is not None:
+            return fallback_response
+
+        return (
+            "Ollama backend is unavailable and no fallback model could be initialized."
+        )
+
+    def _invoke_fallback(self, text: str, tool: bool) -> str | None:
+        if self.fallback_llm is None:
+            return None
+
         try:
-            print_gpu_status()
-            # For Chat models, we can use .invoke with a simple human message
-            # If you prefer plain text, LangChain accepts string directly.
-            out = self.chat_llm.invoke(text)
-            print_gpu_status()
-            # ChatOllama returns a BaseMessage or string depending on version;
-            # extract text robustly:
-            return getattr(out, "content", str(out))
-        except Exception as e:
-            print(f"[OllamaLLM] query error: {e}")
-            return ""
+            return self.fallback_llm.query(text, tool=tool)
+        except TypeError:
+            return self.fallback_llm.query(text)
 
 def create_llm(llm_type: str, **kwargs) -> BaseLLM:
     """

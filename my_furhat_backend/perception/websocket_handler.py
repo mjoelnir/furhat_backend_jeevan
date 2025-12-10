@@ -1,7 +1,18 @@
 from __future__ import annotations
 
+"""
+Perception websocket handler.
+
+Design choices:
+- Keep it single-file and lightweight: FastAPI WebSocket + in-memory session state.
+- Binary frames prefixed (0x01 video, 0x02 audio); text frames carry hello/turn/name.
+- Face/voice recognition are optional; failures should not crash the WS.
+- Create a user on the fly if perception can’t match, so stats can persist.
+"""
+
 import json
 import uuid
+import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -19,6 +30,8 @@ from my_furhat_backend.perception.session_state import (
 from my_furhat_backend.perception.language import detect_language, update_language_distribution
 from my_furhat_backend.perception import face as face_mod
 from my_furhat_backend.perception import voice as voice_mod
+
+logger = logging.getLogger(__name__)
 
 
 VIDEO_PREFIX = 0x01
@@ -70,6 +83,9 @@ async def _send_identity_update(
 def _ensure_user_for_session(db: Session, session_id: str):
     """
     Ensure there is a User associated with this session.
+
+    Chosen to create a user on-demand when no match exists so that turn/name
+    updates and trivia stats have a stable user_id even without biometrics.
     """
     state = get_or_create_session(session_id)
     if state.user_id:
@@ -91,6 +107,10 @@ def _ensure_user_for_session(db: Session, session_id: str):
 
 
 def _update_identity_from_face(db: Session, session_id: str, frame_bytes: bytes):
+    """
+    Try to match or create a user from a face embedding; returns User or None.
+    Soft-fails if face embedding cannot be extracted.
+    """
     state = get_or_create_session(session_id)
 
     emb = face_mod.extract_face_embedding(frame_bytes)
@@ -112,6 +132,10 @@ def _update_identity_from_face(db: Session, session_id: str, frame_bytes: bytes)
 
 
 def _update_identity_from_voice(db: Session, session_id: str, audio_bytes: bytes):
+    """
+    Try to match or create a user from a voice embedding; returns User or None.
+    Soft-fails if voice embedding cannot be extracted.
+    """
     state = get_or_create_session(session_id)
 
     emb = voice_mod.extract_voice_embedding(audio_bytes)
@@ -141,6 +165,11 @@ async def _handle_text_message(
     """
     Handle JSON text messages: hello, turn, name_update.
     Returns updated current_session_id.
+
+    Rationale:
+    - "hello" establishes session_id and initializes language dist.
+    - "turn" updates language dist and turn index; keeps user_id stable/created.
+    - "name_update" writes name to DB and echoes identity_update back.
     """
     try:
         msg = json.loads(text)
@@ -260,6 +289,9 @@ async def _handle_binary_message(
     Handle binary streaming frames:
       - 0x01 + JPEG bytes => video frame
       - 0x02 + audio bytes => audio chunk
+
+    Keeps silent if no session_id yet (requires hello first); soft-fails on
+    decoding/embedding errors to avoid dropping the WS.
     """
     if not data:
         return
@@ -276,8 +308,10 @@ async def _handle_binary_message(
     state = get_or_create_session(session_id)
 
     if stream_type == VIDEO_PREFIX:
+        logger.info(f"[perception] video frame received, bytes={len(payload_bytes)} session={session_id}")
         user = _update_identity_from_face(db, session_id, payload_bytes)
     elif stream_type == AUDIO_PREFIX:
+        logger.info(f"[perception] audio chunk received, bytes={len(payload_bytes)} session={session_id}")
         user = _update_identity_from_voice(db, session_id, payload_bytes)
     else:
         # Unknown binary subtype; ignore
@@ -306,16 +340,26 @@ async def perception_ws_handler(websocket: WebSocket):
       - Binary streaming frames from the Furhat camera/mic.
 
     Designed to run continuously while the skill is active.
+
+    Design: keep the handler minimal—no background tasks here; reconnect logic
+    is handled client-side. On disconnect, DB session is closed cleanly.
     """
     await websocket.accept()
     db: Session = SessionLocal()
     current_session_id: Optional[str] = None
+    log = logging.getLogger("perception.ws")
 
     try:
         while True:
-            message = await websocket.receive()
+            try:
+                message = await websocket.receive()
+            except RuntimeError:
+                # Disconnect already received; exit cleanly
+                log.info("[perception] runtime disconnect")
+                break
 
             if "text" in message and message["text"] is not None:
+                log.info(f"[perception] text message received {len(message['text'])} bytes")
                 current_session_id = await _handle_text_message(
                     websocket,
                     db,
@@ -333,6 +377,6 @@ async def perception_ws_handler(websocket: WebSocket):
 
             # Otherwise ignore (e.g. pings)
     except WebSocketDisconnect:
-        pass
+        log.info("[perception] WebSocketDisconnect")
     finally:
         db.close()

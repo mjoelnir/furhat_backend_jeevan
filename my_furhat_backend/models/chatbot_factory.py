@@ -1,15 +1,10 @@
 """
 Chatbot Factory Module
 
-This module provides a factory pattern implementation for creating different types of chatbots.
-It supports both HuggingFace and LlamaCpp-based chatbots, with a common interface for
-conversation handling and response generation.
-
-Key Components:
-    - BaseChatbot: Abstract base class defining the chatbot interface
-    - Chatbot_HuggingFace: Implementation using HuggingFace models
-    - Chatbot_LlamaCpp: Implementation using LlamaCpp models
-    - create_chatbot: Factory function for instantiating chatbots
+Design choices:
+- Common chatbot interface over multiple backends (HF, LlamaCpp, Ollama).
+- Keep formatting/cleaning helpers centralized (util.py) to reduce duplication.
+- Prefer Ollama when heavy deps (torch/transformers) are missing.
 """
 
 from abc import ABC, abstractmethod
@@ -34,15 +29,8 @@ class BaseChatbot(ABC):
     def chatbot(self, state: dict) -> dict:
         """
         Process the conversation state and return an updated state.
-        
-        Args:
-            state (dict): Current conversation state containing messages
-            
-        Returns:
-            dict: Updated conversation state with new AI response
-            
-        Raises:
-            ValueError: If no messages are found in the state
+
+        Contract: implementations mutate/append to state["messages"] and return state.
         """
         pass
 
@@ -70,16 +58,7 @@ class Chatbot_HuggingFace(BaseChatbot):
     
     def chatbot(self, state: dict) -> dict:
         """
-        Process conversation state using HuggingFace model.
-        
-        Args:
-            state (dict): Current conversation state
-            
-        Returns:
-            dict: Updated state with new AI response
-            
-        Raises:
-            ValueError: If no messages are found in the state
+        Process conversation state using a HF model; format as ChatML for simplicity.
         """
         messages = state.get("messages", [])
         if not messages:
@@ -126,16 +105,7 @@ class Chatbot_LlamaCpp(BaseChatbot):
         
     def chatbot(self, state: dict) -> dict:
         """
-        Process conversation state using LlamaCpp model.
-        
-        Args:
-            state (dict): Current conversation state
-            
-        Returns:
-            dict: Updated state with new AI response
-            
-        Raises:
-            ValueError: If no messages are found in the state
+        Process conversation state using LlamaCpp; uses structured prompt/response parsing.
         """
         messages = state.get("messages", [])
         if not messages:
@@ -166,7 +136,7 @@ class Chatbot_Ollama(BaseChatbot):
     def __init__(
         self,
         model_instance=None,
-        model: str = "llama3.1:instruct",
+        model: str = "llama3.2:latest",
         base_url: str = "http://localhost:11434",
         **kwargs
     ):
@@ -181,8 +151,8 @@ class Chatbot_Ollama(BaseChatbot):
 
     def _infer_language(self, text: str) -> str | None:
         """
-        Super-light heuristic: detect Norwegian vs English vs fallback.
-        Swap to a real detector if you like.
+        Super-light heuristic: detect Norwegian vs English vs fallback; kept
+        minimal to avoid extra deps. Override or enhance as needed.
         """
         if not text:
             return None

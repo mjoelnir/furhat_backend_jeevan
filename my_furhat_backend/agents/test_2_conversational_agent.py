@@ -1,3 +1,10 @@
+"""
+Secondary LangGraph conversational agent scaffold (not used in production).
+
+Design: reference/example showing router + RAG + grading flows. Uses legacy
+paths and prompts; kept for experimentation only.
+"""
+
 import os
 import time
 import logging

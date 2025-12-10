@@ -1,4 +1,13 @@
 # my_furhat_backend/perception/face.py
+"""
+Face recognition helpers using InsightFace.
+
+Design choices:
+- Load InsightFace once at import; if unavailable, fail soft (returns None) so
+  the rest of the backend still works without GPU/onnxruntime.
+- Use simple cosine similarity over stored embeddings; no external vector DB to
+  keep dependencies light.
+"""
 
 from __future__ import annotations
 
@@ -28,7 +37,7 @@ except Exception as e:
 
 
 def _bytes_to_bgr(image_bytes: bytes) -> Optional[np.ndarray]:
-    """Decode image bytes into an OpenCV BGR array."""
+    """Decode image bytes into an OpenCV BGR array; fail soft on errors."""
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -43,6 +52,9 @@ def extract_face_embedding(frame_bytes: bytes) -> Optional[np.ndarray]:
 
     Returns:
         np.ndarray of shape (512,) or similar, or None if failed/no face.
+
+    Rationale: keep it minimal—pick the largest face, use InsightFace normed
+    embeddings; no batching, no multi-face disambiguation for now.
     """
     if _face_app is None:
         return None
@@ -89,6 +101,9 @@ def match_face_embedding(
 
     Returns:
         (User, similarity) if similarity >= threshold, else None.
+
+    Chosen approach: in-DB scan with cosine similarity—sufficient for small user
+    sets; avoids adding a vector DB dependency.
     """
     if embedding is None or embedding.size == 0:
         return None

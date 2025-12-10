@@ -261,6 +261,18 @@ The project includes several GPU optimizations:
 
 ---
 
+## Recent Additions and Defaults (skill + backend)
+
+- **Perception websocket**: Robot streams frames to `/ws/perception` (binary prefix `0x01` video JPEG, `0x02` audio). Text messages carry `hello`, `turn`, `name_update`. Server soft-fails if face/voice libs are missing; user IDs are created on-demand for stats.
+- **Trivia flow**: Kotlin skill calls `/quiz/question`, `/trivia/turn` (LLM phrasing/feedback), and `/memory/trivia` (stats). Local cache + backend persistence (`trivia_stats` table).
+- **Language handling**: Heuristic EN/NO detector client-side; explicit language pinning via `LanguageManager` with Polly voices (`Kendra-Neural` EN, `Ida-Neural` NO). Backend language hinting in prompts; placeholder server-side lang detect.
+- **URLs/IPs**: Default `BACKEND_URL` in the skill points to laptop IP (override via `BACKEND_URL` env). Robot IP tracked in params. Perception WS URL derives from `BACKEND_URL` (`ws://<host>:8000/ws/perception`).
+- **RAG**: Lightweight BM25 (no vector DB) over `DOCUMENTS_PATH` with preference for `qa_pairs.json` when present; falls back to PDFs/txt. Chunk size 800 / overlap 150.
+- **LLM defaults**: Backend uses Ollama (`llama3.2:latest`) by default; HF/LlamaCpp paths are guarded behind torch/transformers availability. System prompt in `config/settings.py` defines the Kaia persona and strict language policy.
+- **Storage/layout**: Backend defaults to local `.cache` for models/caches/docs/vector store/DB (SQLite `furhat_memory.db`). Tables: `users`, `conversations`, `turns`, `trivia_stats`.
+- **Ingestion helper**: `ingestion/web_ingest.py` fetches PDFs via DuckDuckGo HTML + regex (best-effort), storing into a folder you can set as `DOCUMENTS_PATH`.
+
+
 ## Requirements & Installation
 
 This project uses a hybrid dependency management approach: some dependencies are installed via pip into your environment, and others are managed by Poetry (tracked in the `poetry.lock` file).

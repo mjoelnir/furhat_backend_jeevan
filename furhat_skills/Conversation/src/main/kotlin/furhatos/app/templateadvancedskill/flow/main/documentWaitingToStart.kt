@@ -2,7 +2,11 @@ package furhatos.app.templateadvancedskill.flow.main
 
 import furhatos.flow.kotlin.*
 import furhatos.app.templateadvancedskill.flow.Parent
-import furhatos.app.templateadvancedskill.params.AWS_BACKEND_URL
+import furhatos.app.templateadvancedskill.params.BACKEND_URL
+import furhatos.app.templateadvancedskill.perception.UserMemory
+import furhatos.app.templateadvancedskill.perception.UserState
+import furhatos.app.templateadvancedskill.flow.main.restartPerceptionClient
+import furhatos.flow.kotlin.users
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -13,39 +17,25 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
+/**
+ * Initial handoff state after Greeting.
+ * Marks returning users and jumps straight into the trivia flow.
+ */
 val DocumentWaitingToStart: State = state(parent = Parent) {
 
     onEntry {
-        furhat.ask(
-            "I'm ready to assist with your document questions. " +
-            "Could you please tell me what subject you're interested in, " +
-            "or simply the name of the document?"
-        )
-    }
+        val profile = UserState.currentProfile
 
-    // When any response is detected, transition to document-specific Q&A.
-    onResponse {
-        val userInput = it.text.trim()
-
-        // Call the API endpoint /get_docs to perform document retrieval/classification.
-        val bestDocName = callGetDocs(userInput)
-
-        if (bestDocName.isNullOrBlank()) {
-            furhat.say(
-                "I'm having trouble finding a matching document right now. " +
-                "Could you try rephrasing the title or subject?"
-            )
-            reentry()
-        } else {
-            goto(documentInfoQnA(bestDocName))
+        // Mark the user as seen so future sessions in this process
+        // can be treated as returning.
+        if (profile != null) {
+            UserMemory.markSeen(profile.id)
         }
-    }
 
-    onNoResponse {
-        furhat.ask(
-            "I didn't catch that. Please tell me the subject or the name of the document you're interested in."
-        )
-        reentry()
+        // Ensure perception WS is running for every conversation entry.
+        restartPerceptionClient(furhat, users.current)
+
+        goto(QuizFromQaPairs)
     }
 }
 
@@ -54,7 +44,7 @@ val DocumentWaitingToStart: State = state(parent = Parent) {
  * returns the best matching document name (as provided by the backend).
  */
 fun callGetDocs(userInput: String): String? {
-    val url = "$AWS_BACKEND_URL/get_docs"
+    val url = "$BACKEND_URL/get_docs"
 
     val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -82,12 +72,14 @@ fun callGetDocs(userInput: String): String? {
             json.getString("response")
         }
     } catch (e: ConnectException) {
-        // Fallback value – you may want to handle this more gracefully in your flow
-        "I'm sorry, I cannot connect to the server right now. Please try again later."
+        println("callGetDocs connection error: ${e.message}")
+        null
     } catch (e: SocketTimeoutException) {
-        "I'm sorry, the server is taking too long to respond. Please try again later."
+        println("callGetDocs timeout: ${e.message}")
+        null
     } catch (e: Exception) {
-        "I apologize, but I encountered an error processing your request."
+        println("callGetDocs general error: ${e.message}")
+        null
     }
 }
 

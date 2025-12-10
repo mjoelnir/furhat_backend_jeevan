@@ -4,12 +4,20 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
 import okhttp3.*
 import okio.ByteString.Companion.toByteString
 
 /**
  * Client for the /ws/perception WebSocket endpoint.
+ *
+ * Responsibility:
+ *  - Open and maintain the WS to the backend.
+ *  - Stream binary camera/audio frames with a 1-byte prefix (0x01 video, 0x02 audio).
+ *  - Send text payloads for turns and name updates.
+ *  - Keep the socket alive with periodic pings and automatic reconnects.
  */
 class PerceptionClient(
     private val backendWsUrl: String, // e.g. "ws://localhost:8000/ws/perception"
@@ -22,12 +30,28 @@ class PerceptionClient(
 
     @Volatile
     private var webSocket: WebSocket? = null
+    @Volatile
+    private var reconnectAttempts: Int = 0
+    private val maxReconnectAttempts = 5
+    @Volatile
+    private var scopeRef: CoroutineScope? = null
+    @Volatile
+    private var keepaliveJob: Job? = null
 
     /**
      * Connect to the backend WebSocket in the given coroutine scope.
      * This should be called once per Furhat interaction session.
      */
     fun connect(scope: CoroutineScope) {
+        scopeRef = scope
+        reconnectAttempts = 0
+        startWebSocket(scope)
+    }
+
+    /**
+     * Open the websocket and attach the listener for this client.
+     */
+    private fun startWebSocket(scope: CoroutineScope) {
         val request = Request.Builder()
             .url(backendWsUrl)
             .build()
@@ -36,7 +60,10 @@ class PerceptionClient(
 
             override fun onOpen(ws: WebSocket, response: Response) {
                 webSocket = ws
+                println("Perception WS opened to $backendWsUrl (session=$sessionId)")
                 sendHello()
+                reconnectAttempts = 0
+                startKeepalive(scope)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -46,16 +73,61 @@ class PerceptionClient(
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 // Log as needed; for now just print
                 println("Perception WS failure: ${t.message}")
+                webSocket = null
+                stopKeepalive()
+                scheduleReconnect()
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 println("Perception WS closed: $code / $reason")
+                webSocket = null
+                stopKeepalive()
+                scheduleReconnect()
             }
         }
 
         scope.launch(Dispatchers.IO) {
             client.newWebSocket(request, listener)
         }
+    }
+
+    /**
+     * Schedule a delayed reconnect with capped attempts.
+     */
+    private fun scheduleReconnect() {
+        val scope = scopeRef ?: return
+        if (reconnectAttempts >= maxReconnectAttempts) {
+            println("Perception WS reconnect aborted after $reconnectAttempts attempts")
+            return
+        }
+        reconnectAttempts++
+        println("Perception WS scheduling reconnect attempt $reconnectAttempts/$maxReconnectAttempts")
+        scope.launch(Dispatchers.IO) {
+            delay(2000)
+            startWebSocket(this)
+        }
+    }
+
+    /**
+     * Begin periodic ping messages to keep the WS alive.
+     */
+    private fun startKeepalive(scope: CoroutineScope) {
+        stopKeepalive()
+        keepaliveJob = scope.launch(Dispatchers.IO) {
+            while (webSocket != null) {
+                try {
+                    webSocket?.send("""{"type":"ping","payload":{"session_id":"$sessionId","ts":${System.currentTimeMillis()}}}""")
+                } catch (e: Exception) {
+                    println("Perception WS keepalive send error: ${e.message}")
+                }
+                delay(5000)
+            }
+        }
+    }
+
+    private fun stopKeepalive() {
+        keepaliveJob?.cancel()
+        keepaliveJob = null
     }
 
     /**
@@ -138,7 +210,14 @@ class PerceptionClient(
 
     fun sendBinary(payload: ByteArray) {
         try {
-            webSocket?.send(payload.toByteString())
+            val socket = webSocket
+            if (socket == null) {
+                println("Perception WS binary send skipped: socket is null")
+                return
+            }
+            val type = if (payload.isNotEmpty()) payload[0].toInt() else -1
+            println("Perception WS sending binary type=$type bytes=${payload.size}")
+            socket.send(payload.toByteString())
         } catch (e: Exception) {
             println("Perception WS binary send error: ${e.message}")
         }

@@ -1,4 +1,13 @@
 # my_furhat_backend/perception/voice.py
+"""
+Voice recognition helpers using Resemblyzer.
+
+Design choices:
+- Load Resemblyzer encoder once; if missing deps (soundfile/torch), fail soft
+  and return None so the backend still runs without voice ID.
+- Simple cosine similarity over stored embeddings; no vector DB to keep deps
+  light for small user sets.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +15,13 @@ import io
 from typing import Optional, Tuple, List
 
 import numpy as np
-import soundfile as sf
 from sqlalchemy.orm import Session
+
+try:
+    import soundfile as sf  # type: ignore[import]
+except Exception as e:  # noqa: BLE001
+    print(f"[voice] Failed to import soundfile: {e}")
+    sf = None  # type: ignore[assignment]
 
 from my_furhat_backend.db.models import User
 
@@ -23,13 +37,16 @@ except Exception as e:
 
 
 def _bytes_to_mono_float32(audio_bytes: bytes) -> Optional[np.ndarray]:
-    """Decode audio bytes into a mono float32 numpy array."""
+    """Decode audio bytes into a mono float32 numpy array; fail soft if soundfile missing/decoding fails."""
+    if sf is None:
+        # soundfile backend not available
+        return None
     try:
         audio, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
         if audio.ndim > 1:  # stereo → mono
             audio = np.mean(audio, axis=1)
         return preprocess_wav(audio, source_sr=sr)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[voice] Failed to decode audio: {e}")
         return None
 
@@ -40,6 +57,9 @@ def extract_voice_embedding(audio_bytes: bytes) -> Optional[np.ndarray]:
 
     Returns:
         np.ndarray or None.
+
+    Rationale: keep it minimal—single utterance embedding, reject very short
+    clips; no diarization or multi-speaker handling.
     """
     if _voice_encoder is None:
         return None
@@ -78,6 +98,9 @@ def match_voice_embedding(
 
     Returns:
         (User, similarity) if similarity >= threshold, else None.
+
+    Chosen approach: scan stored embeddings in DB with cosine similarity.
+    Works for small user sets without adding a vector search dependency.
     """
     if embedding is None or embedding.size == 0:
         return None

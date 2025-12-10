@@ -1,6 +1,10 @@
 """
-This module provides utility functions for cleaning, formatting, parsing, and summarizing text responses,
-particularly for handling conversation transcripts and responses from language models.
+Utility functions for cleaning, formatting, and parsing text and prompts.
+
+Design choices:
+- Pure-Python (re/json/os) to avoid extra dependencies.
+- Provide forgiving cleaners/parsers so upstream code remains simple and robust
+  when LLM outputs include stray chat markers or malformed JSON.
 
 Functions:
     clean_hc_response(response_text: str) -> str

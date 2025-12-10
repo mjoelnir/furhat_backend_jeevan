@@ -1,3 +1,11 @@
+"""
+Example conversational agent using LangGraph (not used in production).
+
+Design: kept as a reference scaffold to show a LangGraph flow with RAG and
+tool-style context injections. Uses a legacy RAG signature and static model
+path; update or remove for production.
+"""
+
 import os
 import logging
 import uuid

@@ -1,3 +1,13 @@
+"""
+Tool wrappers exposed to LLMs via LangChain's @tool decorator.
+
+Design choices:
+- Keep schemas minimal with Pydantic for validation and tool-call clarity.
+- Use thin wrappers around existing API clients (Foursquare, OSM/Nominatim, Overpass)
+  to avoid duplicating request logic here.
+- Return plain dict/list payloads suitable for direct LLM consumption.
+"""
+
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from my_furhat_backend.api_clients.foursquare_client import FoursquareClient
@@ -16,8 +26,8 @@ def foursquare_tool(lat: float, lon: float, query: str, tool_call_id: str = None
     """
     Search for venues using the Foursquare API.
 
-    This tool uses the FoursquareClient to search for places near the specified coordinates
-    that match the given search query.
+    Thin wrapper over FoursquareClient.search_places; keeps the tool signature
+    LLM-friendly and returns only the results list.
 
     Parameters:
         lat (float): Latitude coordinate.
@@ -49,14 +59,8 @@ def osm_tool(lat: float, lon: float, query: str, tool_call_id: str = None) -> li
     """
     Search for Points of Interest (POIs) using OpenStreetMap's Nominatim service.
     
-    This tool provides geospatial search functionality by:
-    1. Converting coordinates to a location string
-    2. Querying the Nominatim service for nearby POIs
-    3. Filtering results based on the search query
-    4. Returning formatted POI information
-    
-    The tool uses rate-limited API calls to comply with Nominatim's
-    usage policies and includes error handling for API failures.
+    Wrapper over OSMClient.search_pois (Nominatim). Rate limits and error handling
+    are inside the client; this function stays declarative for LLM tools.
     
     Parameters:
         lat (float): Latitude coordinate in decimal degrees (-90 to 90)
@@ -92,7 +96,7 @@ def overpass_tool(lat: float, lon: float, query: str, tool_call_id: str = None) 
     """
     Search for Points of Interest (POIs) using the Overpass API.
 
-    This tool uses the OverpassClient to query for POIs around the specified location that match the given query.
+    Wrapper over OverpassClient.search_pois for Overpass-based POI search.
 
     Parameters:
         lat (float): Latitude coordinate.

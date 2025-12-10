@@ -31,21 +31,25 @@ The server integrates with a backend agent (DocumentAgent) which is responsible 
 retrieving relevant document context, and generating responses using an LLM.
 """
 
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket, Depends
 from pydantic import BaseModel
 import uvicorn
 import asyncio
 import logging
 from datetime import datetime
+from sqlalchemy.orm import Session
 
 # Import the DocumentAgent and utility functions from the backend.
 from my_furhat_backend.agents.document_agent import DocumentAgent
 from my_furhat_backend.utils.util import (
-    get_list_docs, 
-    classify_text
+    get_list_docs,
+    classify_text,
 )
+from my_furhat_backend.utils.qa_pairs import get_random_qa_pair
+from my_furhat_backend.utils.ollama_bootstrap import ensure_ollama_ready
 
-from my_furhat_backend.db.session import init_db
+from my_furhat_backend.db import crud
+from my_furhat_backend.db.session import init_db, get_db
 from my_furhat_backend.perception.websocket_handler import perception_ws_handler
 
 # Initialize the FastAPI application.
@@ -58,11 +62,42 @@ logger = logging.getLogger(__name__)
 
 class Transcription(BaseModel):
     content: str
+    # Optional preferred language hint from the client, e.g. "English" or "Norwegian"
+    preferred_language: str | None = None
 
 
 class EngageRequest(BaseModel):
     document: str
     answer: str
+
+
+class QuizQuestionResponse(BaseModel):
+    index: int
+    question: str
+    answer: str
+
+
+class TriviaTurnRequest(BaseModel):
+    phase: str  # "ask" or "feedback"
+    question: str
+    answer: str
+    user_answer: str | None = None
+    preferred_language: str | None = None
+
+
+class TriviaTurnResponse(BaseModel):
+    utterance: str
+
+
+class TriviaMemoryRequest(BaseModel):
+    user_id: str
+    correct: bool
+
+
+class TriviaStatsResponse(BaseModel):
+    user_id: str
+    total_questions: int
+    correct_answers: int
 
 
 # For demonstration purposes, using a simple in-memory store for the latest response.
@@ -75,6 +110,7 @@ agent = DocumentAgent()
 @app.on_event("startup")
 def on_startup():
     init_db()
+    ensure_ollama_ready()
     logger.info("Database initialized.")
 
 
@@ -82,7 +118,11 @@ def on_startup():
 async def ask_question(transcription: Transcription):
     global latest_response
     try:
-        latest_response = await asyncio.to_thread(agent.run, transcription.content)
+        latest_response = await asyncio.to_thread(
+            agent.run,
+            transcription.content,
+            transcription.preferred_language,
+        )
         response = {
             "status": "success",
             "response": latest_response,
@@ -102,7 +142,11 @@ async def ask_question(transcription: Transcription):
 async def transcribe(transcription: Transcription):
     global latest_response
     try:
-        latest_response = await asyncio.to_thread(agent.run, transcription.content)
+        latest_response = await asyncio.to_thread(
+            agent.run,
+            transcription.content,
+            transcription.preferred_language,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"status": "transcription received"}
@@ -147,6 +191,87 @@ async def engage(engage_request: EngageRequest):
     except Exception as e:
         logger.error(f"Error in engage endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/quiz/question", response_model=QuizQuestionResponse)
+async def quiz_question() -> QuizQuestionResponse:
+    """
+    Return a single random question–answer pair from qa_pairs.json.
+
+    The answer is included so the frontend can judge correctness and
+    reveal the correct answer to the user.
+    """
+    pair = get_random_qa_pair()
+    if pair is None:
+        raise HTTPException(
+            status_code=500,
+            detail="No QA pairs available. Ensure qa_pairs.json is present.",
+        )
+    return QuizQuestionResponse(index=pair.index, question=pair.question, answer=pair.answer)
+
+
+@app.post("/trivia/turn", response_model=TriviaTurnResponse)
+async def trivia_turn(req: TriviaTurnRequest) -> TriviaTurnResponse:
+    """
+    LLM-powered helper for the trivia game.
+
+    - phase == "ask": localise and phrase the trivia question in the user's language.
+    - phase == "feedback": phrase a short correctness/feedback line in the user's language.
+    """
+    try:
+        utterance = await asyncio.to_thread(
+            agent.trivia_turn,
+            req.phase,
+            req.question,
+            req.answer,
+            req.user_answer,
+            req.preferred_language,
+        )
+        return TriviaTurnResponse(utterance=utterance)
+    except Exception as e:
+        logger.error(f"Error in trivia_turn endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory/trivia/{user_id}", response_model=TriviaStatsResponse)
+async def get_trivia_stats(
+    user_id: str,
+    db: Session = Depends(get_db),
+) -> TriviaStatsResponse:
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    stats = await asyncio.to_thread(crud.get_trivia_stat, db, user_id)
+    if stats is None:
+        return TriviaStatsResponse(user_id=user_id, total_questions=0, correct_answers=0)
+
+    return TriviaStatsResponse(
+        user_id=user_id,
+        total_questions=stats.total_questions,
+        correct_answers=stats.correct_answers,
+    )
+
+
+@app.post("/memory/trivia", response_model=TriviaStatsResponse)
+async def update_trivia_stats(
+    payload: TriviaMemoryRequest,
+    db: Session = Depends(get_db),
+) -> TriviaStatsResponse:
+    if not payload.user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    stats = await asyncio.to_thread(
+        crud.increment_trivia_stat,
+        db,
+        payload.user_id,
+        payload.correct,
+    )
+
+    return TriviaStatsResponse(
+        user_id=stats.user_id,
+        total_questions=stats.total_questions,
+        correct_answers=stats.correct_answers,
+    )
 
 
 @app.websocket("/ws/perception")

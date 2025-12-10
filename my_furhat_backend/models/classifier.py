@@ -1,45 +1,65 @@
-from transformers import pipeline
+try:
+    from transformers import pipeline  # type: ignore[import]
+except Exception as e:  # noqa: BLE001
+    print(
+        f"[classifier] Transformers pipeline unavailable, falling back to "
+        f"naive string-similarity classifier: {e}"
+    )
+    pipeline = None  # type: ignore[assignment]
+
 
 class TextClassifier:
     """
-    A simple text classifier using a zero-shot classification pipeline.
+    Text classifier for ranking documents against a query.
 
-    This class leverages Hugging Face's transformers library to perform zero-shot 
-    classification, which allows classification without task-specific training data.
+    Design:
+    - Preferred: Hugging Face zero-shot classification (if transformers+torch available).
+    - Fallback: simple lexical overlap scoring when HF stack is not available, to avoid hard
+      dependency on GPU/libtorch for small doc sets.
     """
 
-    def __init__(self, model_id="facebook/bart-large-mnli"):
+    def __init__(self, model_id: str = "facebook/bart-large-mnli"):
         """
-        Initialize the TextClassifier with a specified model.
+        Initialize the TextClassifier.
 
-        Parameters:
-            model_id (str): The Hugging Face model identifier to use for zero-shot classification.
-                            Default is "facebook/bart-large-mnli".
+        If transformers.pipeline is available, create a zero-shot classification
+        pipeline. Otherwise, use a lightweight lexical heuristic to keep running
+        without the HF stack.
         """
-        # Create a zero-shot classification pipeline using the specified model.
-        self.classifier = pipeline("zero-shot-classification", model=model_id)
-    
-    def classify(self, text: str, labels: list) -> dict:
-        """
-        Classify the given text into one or more labels using zero-shot classification.
+        if pipeline is None:
+            self.classifier = None
+        else:
+            self.classifier = pipeline("zero-shot-classification", model=model_id)
 
-        Parameters:
-            text (str): The text to classify.
-            labels (list): A list of candidate labels for classification.
+    def _lexical_score(self, text: str, label: str) -> float:
+        """
+        Very simple similarity: proportion of label tokens that appear in the text.
+        """
+        text_l = text.lower()
+        label_tokens = [tok for tok in label.lower().split() if tok]
+        if not label_tokens:
+            return 0.0
+        matches = sum(1 for tok in label_tokens if tok in text_l)
+        return matches / len(label_tokens)
+
+    def classify(self, text: str, labels: list[str]) -> dict:
+        """
+        Rank labels for a given text.
 
         Returns:
-            dict: A dictionary mapping each label to its corresponding score, sorted in descending order.
+            dict: {label: score}, sorted by score descending.
         """
-        # Perform zero-shot classification on the input text with the given labels,
-        # allowing multiple labels to be assigned (multi_label=True).
-        scores = self.classifier(text, labels, multi_label=True)
-        
-        # Create a dictionary mapping labels to their scores.
-        scores_with_labels = dict(zip(scores["labels"], scores["scores"]))
-        
+        if not labels:
+            return {}
+
+        # HF-based zero-shot classification if available
+        if self.classifier is not None:
+            scores = self.classifier(text, labels, multi_label=True)
+            scores_with_labels = dict(zip(scores["labels"], scores["scores"]))
+        else:
+            # Fallback: lexical overlap
+            scores_with_labels = {label: self._lexical_score(text, label) for label in labels}
+
         # Sort the dictionary by scores in descending order.
-        scores_with_labels_descending = dict(
-            sorted(scores_with_labels.items(), key=lambda item: item[1], reverse=True)
-        )
-        
-        return scores_with_labels_descending
+        sorted_items = sorted(scores_with_labels.items(), key=lambda item: item[1], reverse=True)
+        return dict(sorted_items)
